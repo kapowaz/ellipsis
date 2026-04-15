@@ -528,7 +528,7 @@ cmd_sync() {
         for dir in $ELLIPSIS_AUTO_ADD_DIRS; do
             # Expand ~ if present
             dir="${dir/#\~/$HOME}"
-            [[ -d "$dir" ]] && yadm add "$dir" 2>/dev/null || true
+            if [[ -d "$dir" ]]; then yadm add "$dir" 2>/dev/null || true; fi
         done
     fi
 
@@ -808,7 +808,7 @@ cmd_uninstall() {
     fi
 
     # Remove lock if present
-    rmdir "$ELLIPSIS_LOCK" 2>/dev/null && echo "Removed stale lock file" || true
+    if rmdir "$ELLIPSIS_LOCK" 2>/dev/null; then echo "Removed stale lock file"; fi
 
     echo ""
     local bin_path
