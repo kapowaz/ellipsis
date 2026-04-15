@@ -15,15 +15,21 @@ ellipsis watches your yadm-tracked dotfiles and automatically commits and pushes
 
 ## Installation
 
-### Quick install
+### Homebrew (recommended)
+
+```bash
+brew install kapowaz/tap/ellipsis
+```
+
+This also installs yadm as a dependency.
+
+### Alternative: curl install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kapowaz/ellipsis/main/install.sh | bash
 ```
 
-### Manual install
-
-Download the `ellipsis` script and put it somewhere in your `PATH`:
+### Alternative: manual install
 
 ```bash
 curl -O https://raw.githubusercontent.com/kapowaz/ellipsis/main/ellipsis
@@ -33,7 +39,7 @@ mv ellipsis ~/bin/  # or /usr/local/bin/
 
 ### Prerequisites
 
-- [yadm](https://yadm.io/) (`brew install yadm` on macOS)
+- [yadm](https://yadm.io/) (installed automatically by the Homebrew formula)
 - git
 - An initialised yadm repo with a remote
 
@@ -42,7 +48,7 @@ mv ellipsis ~/bin/  # or /usr/local/bin/
 1. Set up yadm if you haven't already:
 
    ```bash
-   brew install yadm
+   brew install kapowaz/tap/ellipsis  # installs both ellipsis and yadm
    yadm init
    yadm remote add origin git@github.com:you/dotfiles.git
    ```
