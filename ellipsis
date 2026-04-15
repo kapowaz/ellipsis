@@ -1,0 +1,883 @@
+#!/bin/bash
+set -euo pipefail
+
+ELLIPSIS_VERSION="1.0.0"
+
+# --- Defaults (overridden by config) ---
+ELLIPSIS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ellipsis"
+ELLIPSIS_CONFIG_FILE="$ELLIPSIS_CONFIG_DIR/config.sh"
+ELLIPSIS_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ellipsis"
+ELLIPSIS_LOGFILE="$ELLIPSIS_DATA_DIR/sync.log"
+ELLIPSIS_LOCK="/tmp/ellipsis-sync.lock"
+ELLIPSIS_SYNC_INTERVAL=900
+ELLIPSIS_AUTO_ADD_DIRS=""
+ELLIPSIS_REMOTE_HOST=""
+ELLIPSIS_REMOTE_TRANSPORT=""
+ELLIPSIS_COMMIT_PREFIX="auto"
+ELLIPSIS_SHELL_CONFIGS=""
+ELLIPSIS_EXTRA_SECRET_PATTERNS=""
+ELLIPSIS_LAUNCHD_LABEL="io.github.ellipsis.sync"
+# Marker comment used to identify ellipsis-managed hooks
+# (referenced by string literal in install_hook, cmd_doctor, cmd_uninstall)
+
+# --- Load config if it exists ---
+load_config() {
+    if [[ -f "$ELLIPSIS_CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$ELLIPSIS_CONFIG_FILE"
+    fi
+}
+
+# --- Utility functions ---
+log() {
+    mkdir -p "$(dirname "$ELLIPSIS_LOGFILE")"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$ELLIPSIS_LOGFILE"
+}
+
+detect_os() {
+    case "$(uname -s)" in
+        Darwin) echo "macos" ;;
+        Linux)  echo "linux" ;;
+        *)      echo "unknown" ;;
+    esac
+}
+
+detect_remote() {
+    local url
+    url=$(yadm remote get-url origin 2>/dev/null) || return 1
+
+    if [[ "$url" =~ ^git@ ]] || [[ "$url" =~ ^ssh:// ]]; then
+        ELLIPSIS_REMOTE_TRANSPORT="ssh"
+        # Extract host from git@host:... or ssh://git@host/...
+        if [[ "$url" =~ ^git@([^:]+): ]]; then
+            ELLIPSIS_REMOTE_HOST="${BASH_REMATCH[1]}"
+        elif [[ "$url" =~ ^ssh://[^@]+@([^/]+) ]]; then
+            ELLIPSIS_REMOTE_HOST="${BASH_REMATCH[1]}"
+        fi
+    elif [[ "$url" =~ ^https?:// ]]; then
+        ELLIPSIS_REMOTE_TRANSPORT="https"
+        # Extract host from https://host/...
+        if [[ "$url" =~ ^https?://([^/]+) ]]; then
+            ELLIPSIS_REMOTE_HOST="${BASH_REMATCH[1]}"
+        fi
+    elif [[ "$url" =~ ^file:// ]] || [[ "$url" =~ ^/ ]]; then
+        ELLIPSIS_REMOTE_TRANSPORT="local"
+        ELLIPSIS_REMOTE_HOST="localhost"
+    fi
+}
+
+detect_shell_configs() {
+    local shell_name configs=""
+    shell_name=$(basename "${SHELL:-/bin/bash}")
+
+    case "$shell_name" in
+        zsh)
+            [[ -f "$HOME/.zshrc" ]] && configs=".zshrc"
+            [[ -f "$HOME/.zshenv" ]] && configs="$configs .zshenv"
+            ;;
+        bash)
+            [[ -f "$HOME/.bashrc" ]] && configs=".bashrc"
+            [[ -f "$HOME/.bash_profile" ]] && configs="$configs .bash_profile"
+            ;;
+        fish)
+            [[ -f "$HOME/.config/fish/config.fish" ]] && configs=".config/fish/config.fish"
+            ;;
+    esac
+
+    # Trim leading space
+    echo "${configs# }"
+}
+
+check_network() {
+    local transport="${ELLIPSIS_REMOTE_TRANSPORT:-ssh}"
+    local host="${ELLIPSIS_REMOTE_HOST:-github.com}"
+
+    case "$transport" in
+        ssh)
+            local ssh_output
+            ssh_output=$(/usr/bin/ssh -o ConnectTimeout=5 -o BatchMode=yes "git@${host}" 2>&1 || true)
+            echo "$ssh_output" | grep -q "successfully authenticated"
+            ;;
+        https)
+            local url
+            url=$(yadm remote get-url origin 2>/dev/null) || return 1
+            git ls-remote --exit-code "$url" HEAD > /dev/null 2>&1
+            ;;
+        local)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+require_yadm() {
+    if ! command -v yadm &> /dev/null; then
+        echo "Error: yadm is not installed."
+        echo "Install it with: brew install yadm (macOS) or your package manager"
+        exit 1
+    fi
+    if ! yadm status &> /dev/null; then
+        echo "Error: yadm repo is not initialized."
+        echo "Run: yadm init && yadm remote add origin <your-repo-url>"
+        exit 1
+    fi
+}
+
+ellipsis_bin_path() {
+    # Resolve the path to this script
+    local path="$0"
+    if command -v realpath &> /dev/null; then
+        realpath "$path"
+    elif command -v readlink &> /dev/null; then
+        readlink -f "$path" 2>/dev/null || echo "$path"
+    else
+        echo "$path"
+    fi
+}
+
+yadm_hook_dir() {
+    echo "$HOME/.local/share/yadm/repo.git/hooks"
+}
+
+launchagent_path() {
+    echo "$HOME/Library/LaunchAgents/${ELLIPSIS_LAUNCHD_LABEL}.plist"
+}
+
+# --- Subcommand: init ---
+cmd_init() {
+    echo "ellipsis init -- setting up automated dotfile syncing"
+    echo ""
+
+    require_yadm
+
+    # Check for remote
+    if ! yadm remote get-url origin &> /dev/null; then
+        echo "Error: no yadm remote configured."
+        echo "Run: yadm remote add origin <your-repo-url>"
+        exit 1
+    fi
+
+    # Auto-detect values
+    detect_remote
+    local shell_configs
+    shell_configs=$(detect_shell_configs)
+    local os
+    os=$(detect_os)
+    local scheduler
+    case "$os" in
+        macos) scheduler="launchd" ;;
+        linux)
+            if command -v systemctl &> /dev/null; then
+                scheduler="systemd"
+            else
+                scheduler="cron"
+            fi
+            ;;
+        *) scheduler="none" ;;
+    esac
+
+    # Present detected values
+    echo "Detected configuration:"
+    echo "  Remote host:      ${ELLIPSIS_REMOTE_HOST:-unknown} (${ELLIPSIS_REMOTE_TRANSPORT:-unknown})"
+    echo "  Shell configs:    ${shell_configs:-none detected}"
+    echo "  Auto-add dirs:    ${ELLIPSIS_AUTO_ADD_DIRS:-(none)}"
+    echo "  Sync interval:    ${ELLIPSIS_SYNC_INTERVAL}s ($((ELLIPSIS_SYNC_INTERVAL / 60)) minutes)"
+    echo "  OS scheduler:     $scheduler ($os)"
+    echo ""
+
+    read -rp "Accept these defaults? [Y/n] " accept
+    if [[ "${accept,,}" == "n" ]]; then
+        read -rp "Remote host [${ELLIPSIS_REMOTE_HOST}]: " input
+        [[ -n "$input" ]] && ELLIPSIS_REMOTE_HOST="$input"
+
+        read -rp "Remote transport (ssh/https) [${ELLIPSIS_REMOTE_TRANSPORT}]: " input
+        [[ -n "$input" ]] && ELLIPSIS_REMOTE_TRANSPORT="$input"
+
+        read -rp "Shell configs (space-separated) [${shell_configs}]: " input
+        [[ -n "$input" ]] && shell_configs="$input"
+
+        read -rp "Auto-add directories (space-separated) [${ELLIPSIS_AUTO_ADD_DIRS}]: " input
+        [[ -n "$input" ]] && ELLIPSIS_AUTO_ADD_DIRS="$input"
+
+        read -rp "Sync interval in seconds [${ELLIPSIS_SYNC_INTERVAL}]: " input
+        [[ -n "$input" ]] && ELLIPSIS_SYNC_INTERVAL="$input"
+    fi
+
+    ELLIPSIS_SHELL_CONFIGS="$shell_configs"
+
+    # Write config file
+    mkdir -p "$ELLIPSIS_CONFIG_DIR"
+    cat > "$ELLIPSIS_CONFIG_FILE" << EOF
+# ellipsis configuration -- generated by ellipsis init
+# Only non-default values are set. See 'ellipsis help' for all options.
+
+ELLIPSIS_REMOTE_HOST="$ELLIPSIS_REMOTE_HOST"
+ELLIPSIS_REMOTE_TRANSPORT="$ELLIPSIS_REMOTE_TRANSPORT"
+ELLIPSIS_SHELL_CONFIGS="$ELLIPSIS_SHELL_CONFIGS"
+ELLIPSIS_SYNC_INTERVAL=$ELLIPSIS_SYNC_INTERVAL
+ELLIPSIS_AUTO_ADD_DIRS="$ELLIPSIS_AUTO_ADD_DIRS"
+
+# Uncomment to customise:
+# ELLIPSIS_COMMIT_PREFIX="auto"
+# ELLIPSIS_LOGFILE="$ELLIPSIS_DATA_DIR/sync.log"
+# ELLIPSIS_LOCK="/tmp/ellipsis-sync.lock"
+# ELLIPSIS_LAUNCHD_LABEL="io.github.ellipsis.sync"
+# ELLIPSIS_EXTRA_SECRET_PATTERNS=""
+EOF
+    echo "Wrote config to $ELLIPSIS_CONFIG_FILE"
+
+    # Install pre-commit hook
+    local hook_dir
+    hook_dir=$(yadm_hook_dir)
+    local hook_file="$hook_dir/pre-commit"
+    mkdir -p "$hook_dir"
+
+    if [[ -f "$hook_file" ]] && ! grep -q "Managed by ellipsis" "$hook_file"; then
+        local backup
+        backup="$hook_file.backup.$(date +%s)"
+        cp "$hook_file" "$backup"
+        echo "Backed up existing pre-commit hook to $backup"
+    fi
+
+    install_hook "$hook_file"
+    echo "Installed pre-commit hook"
+
+    # Install scheduler
+    local bin_path
+    bin_path=$(ellipsis_bin_path)
+
+    case "$scheduler" in
+        launchd) install_launchd "$bin_path" ;;
+        systemd) install_systemd "$bin_path" ;;
+        cron)    install_cron "$bin_path" ;;
+        *)
+            echo "Warning: could not detect a scheduler for this OS."
+            echo "You can run 'ellipsis sync' manually or set up your own cron job."
+            ;;
+    esac
+
+    # Check for existing dotfiles-sync to migrate
+    migrate_existing
+
+    echo ""
+    echo "Setup complete. Run 'ellipsis doctor' to verify."
+}
+
+install_hook() {
+    local hook_file="$1"
+    local shell_configs_for_hook="$ELLIPSIS_SHELL_CONFIGS"
+
+    cat > "$hook_file" << 'HOOKEOF'
+#!/bin/bash
+# Managed by ellipsis -- do not remove this line
+set -euo pipefail
+
+ERRORS=0
+HOOKEOF
+
+    # Add shell config validation (with the actual config list baked in)
+    cat >> "$hook_file" << HOOKEOF
+
+# Shell config files to validate
+SHELL_CONFIGS="$shell_configs_for_hook"
+
+for config in \$SHELL_CONFIGS; do
+    if yadm diff --cached --name-only | grep -q "^\${config}\$"; then
+        CONTENT=\$(yadm show :".\${config}")
+
+        # Syntax check
+        case "\$config" in
+            .zshrc|.zshenv|.zprofile)
+                if command -v zsh &> /dev/null; then
+                    if ! echo "\$CONTENT" | zsh -n 2>/dev/null; then
+                        echo "ERROR: \$config has syntax errors"
+                        ERRORS=1
+                    fi
+                fi
+                ;;
+            .bashrc|.bash_profile|.profile)
+                if ! echo "\$CONTENT" | bash -n 2>/dev/null; then
+                    echo "ERROR: \$config has syntax errors"
+                    ERRORS=1
+                fi
+                ;;
+            *config.fish)
+                if command -v fish &> /dev/null; then
+                    if ! echo "\$CONTENT" | fish --no-execute 2>/dev/null; then
+                        echo "ERROR: \$config has syntax errors"
+                        ERRORS=1
+                    fi
+                fi
+                ;;
+        esac
+
+        # Secrets detection in shell configs
+        if echo "\$CONTENT" | grep -qE '(PASSWORD|TOKEN|SECRET|API_KEY)=".+"|(_TOKEN|_SECRET|_KEY)=[^\$"]+[a-zA-Z0-9]{8}'; then
+            echo "ERROR: \$config appears to contain inline secrets"
+            ERRORS=1
+        fi
+
+        # Duplicate PATH entries (warning only)
+        DUPES=\$(echo "\$CONTENT" | grep -oE '/[a-zA-Z0-9_./-]+' | sort | uniq -d || true)
+        if [ -n "\$DUPES" ]; then
+            echo "WARNING: Possible duplicate PATH entries in \$config:"
+            echo "\$DUPES" | sed 's/^/  /'
+        fi
+    fi
+done
+HOOKEOF
+
+    # Add token scanning for all staged files
+    cat >> "$hook_file" << 'HOOKEOF'
+
+# Scan all staged files for common secret patterns
+PATTERNS='npm_[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|gho_[a-zA-Z0-9]{36}|sk-[a-zA-Z0-9]{20,}|glpat-[a-zA-Z0-9\-_]{20,}|AKIA[0-9A-Z]{16}|xoxb-[0-9]{10,}-[a-zA-Z0-9]{20,}'
+HOOKEOF
+
+    # Add extra patterns from config if set
+    if [[ -n "$ELLIPSIS_EXTRA_SECRET_PATTERNS" ]]; then
+        cat >> "$hook_file" << HOOKEOF
+PATTERNS="\${PATTERNS}|${ELLIPSIS_EXTRA_SECRET_PATTERNS}"
+HOOKEOF
+    fi
+
+    cat >> "$hook_file" << 'HOOKEOF'
+
+STAGED=$(yadm diff --cached -U0)
+if echo "$STAGED" | grep -qE "^\+.*(${PATTERNS})"; then
+    echo "ERROR: Staged changes contain what looks like an API token"
+    ERRORS=1
+fi
+
+if [ "$ERRORS" -ne 0 ]; then
+    echo "Pre-commit checks failed. Commit blocked."
+    exit 1
+fi
+HOOKEOF
+
+    chmod +x "$hook_file"
+}
+
+install_launchd() {
+    local bin_path="$1"
+    local plist_path
+    plist_path=$(launchagent_path)
+    local plist_dir
+    plist_dir=$(dirname "$plist_path")
+
+    mkdir -p "$plist_dir"
+
+    # Unload if already loaded
+    if launchctl list 2>/dev/null | grep -q "$ELLIPSIS_LAUNCHD_LABEL"; then
+        launchctl unload "$plist_path" 2>/dev/null || true
+    fi
+
+    # Determine Homebrew prefix for PATH
+    local brew_prefix="/opt/homebrew/bin"
+    if [[ -d "/usr/local/Homebrew" ]]; then
+        brew_prefix="/usr/local/bin"
+    fi
+
+    # Determine the directory containing ellipsis for PATH
+    local bin_dir
+    bin_dir=$(dirname "$bin_path")
+
+    cat > "$plist_path" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${ELLIPSIS_LAUNCHD_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${bin_path}</string>
+        <string>sync</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>${ELLIPSIS_SYNC_INTERVAL}</integer>
+
+    <key>StandardOutPath</key>
+    <string>${ELLIPSIS_DATA_DIR}/launchd-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${ELLIPSIS_DATA_DIR}/launchd-stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${brew_prefix}:${bin_dir}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>${HOME}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>
+EOF
+
+    mkdir -p "$ELLIPSIS_DATA_DIR"
+    launchctl load "$plist_path"
+    echo "Installed and loaded LaunchAgent ($ELLIPSIS_LAUNCHD_LABEL)"
+}
+
+install_systemd() {
+    local bin_path="$1"
+    local unit_dir="$HOME/.config/systemd/user"
+    mkdir -p "$unit_dir"
+
+    cat > "$unit_dir/ellipsis-sync.service" << EOF
+[Unit]
+Description=ellipsis dotfile sync
+
+[Service]
+Type=oneshot
+ExecStart=${bin_path} sync
+EOF
+
+    cat > "$unit_dir/ellipsis-sync.timer" << EOF
+[Unit]
+Description=ellipsis dotfile sync timer
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=${ELLIPSIS_SYNC_INTERVAL}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl --user daemon-reload
+    systemctl --user enable --now ellipsis-sync.timer
+    echo "Installed and enabled systemd timer (ellipsis-sync.timer)"
+}
+
+install_cron() {
+    local bin_path="$1"
+    local interval_minutes=$((ELLIPSIS_SYNC_INTERVAL / 60))
+    [[ "$interval_minutes" -lt 1 ]] && interval_minutes=1
+    local cron_entry="*/${interval_minutes} * * * * ${bin_path} sync # ellipsis-sync"
+
+    # Remove any existing ellipsis cron entry and add the new one
+    (crontab -l 2>/dev/null | grep -v "# ellipsis-sync"; echo "$cron_entry") | crontab -
+    echo "Installed cron job (every ${interval_minutes} minutes)"
+}
+
+migrate_existing() {
+    # Check for the bespoke dotfiles-sync setup
+    local old_plist=""
+    local old_script="$HOME/bin/dotfiles-sync"
+
+    # Look for any existing dotfiles-sync LaunchAgent
+    for f in "$HOME"/Library/LaunchAgents/*dotfiles-sync*.plist; do
+        [[ -f "$f" ]] && old_plist="$f" && break
+    done
+
+    if [[ -n "$old_plist" ]] || [[ -f "$old_script" ]]; then
+        echo ""
+        echo "Detected existing dotfiles-sync setup:"
+        [[ -n "$old_plist" ]] && echo "  LaunchAgent: $old_plist"
+        [[ -f "$old_script" ]] && echo "  Script: $old_script"
+        echo ""
+        read -rp "Unload the old LaunchAgent? (ellipsis will handle syncing now) [Y/n] " migrate
+
+        if [[ "${migrate,,}" != "n" ]]; then
+            if [[ -n "$old_plist" ]]; then
+                launchctl unload "$old_plist" 2>/dev/null || true
+                echo "Unloaded old LaunchAgent."
+                echo "You can remove the plist manually: rm $old_plist"
+            fi
+            if [[ -f "$old_script" ]]; then
+                echo "You can remove the old script manually: rm $old_script"
+            fi
+        fi
+    fi
+}
+
+# --- Subcommand: sync ---
+cmd_sync() {
+    load_config
+
+    mkdir -p "$(dirname "$ELLIPSIS_LOGFILE")"
+
+    # Acquire lock
+    if ! mkdir "$ELLIPSIS_LOCK" 2>/dev/null; then
+        log "SKIP: another sync is already running"
+        exit 0
+    fi
+    trap 'rmdir "$ELLIPSIS_LOCK" 2>/dev/null' EXIT
+
+    # Network check
+    if ! check_network; then
+        log "SKIP: ${ELLIPSIS_REMOTE_HOST:-remote} not reachable"
+        exit 0
+    fi
+
+    # Auto-add directories
+    if [[ -n "$ELLIPSIS_AUTO_ADD_DIRS" ]]; then
+        for dir in $ELLIPSIS_AUTO_ADD_DIRS; do
+            # Expand ~ if present
+            dir="${dir/#\~/$HOME}"
+            [[ -d "$dir" ]] && yadm add "$dir" 2>/dev/null || true
+        done
+    fi
+
+    # Stage modifications to tracked files
+    yadm add -u
+
+    # Check for changes
+    if yadm diff --cached --quiet; then
+        log "OK: no changes"
+        exit 0
+    fi
+
+    # Build commit message
+    local changed file_count first_file msg
+    changed=$(yadm diff --cached --name-only)
+    file_count=$(echo "$changed" | wc -l | tr -d ' ')
+    first_file=$(echo "$changed" | head -1)
+
+    if [ "$file_count" -eq 1 ]; then
+        msg="${ELLIPSIS_COMMIT_PREFIX}: update ${first_file}"
+    else
+        msg="${ELLIPSIS_COMMIT_PREFIX}: update ${file_count} files (${first_file}, ...)"
+    fi
+
+    if yadm commit -m "$msg" 2>> "$ELLIPSIS_LOGFILE"; then
+        if yadm push 2>> "$ELLIPSIS_LOGFILE"; then
+            log "OK: pushed ($msg)"
+        else
+            log "WARN: commit created but push failed (will retry next cycle)"
+        fi
+    else
+        log "WARN: commit failed (pre-commit hook may have blocked it)"
+    fi
+}
+
+# --- Subcommand: log ---
+cmd_log() {
+    load_config
+
+    if [[ ! -f "$ELLIPSIS_LOGFILE" ]]; then
+        echo "No sync log found. Run 'ellipsis sync' or wait for the scheduler."
+        exit 0
+    fi
+
+    local follow=false
+    local lines=20
+    local clear=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--follow)  follow=true; shift ;;
+            -n)           lines="$2"; shift 2 ;;
+            --clear)      clear=true; shift ;;
+            *)            echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    if $clear; then
+        read -rp "Clear the sync log? [y/N] " confirm
+        if [[ "${confirm,,}" == "y" ]]; then
+            : > "$ELLIPSIS_LOGFILE"
+            echo "Log cleared."
+        fi
+        return
+    fi
+
+    if $follow; then
+        tail -f "$ELLIPSIS_LOGFILE"
+    else
+        tail -n "$lines" "$ELLIPSIS_LOGFILE"
+    fi
+}
+
+# --- Subcommand: doctor ---
+cmd_doctor() {
+    load_config
+
+    local failures=0
+
+    # 1. yadm installed
+    if command -v yadm &> /dev/null; then
+        local yadm_version
+        yadm_version=$(yadm version 2>/dev/null | grep "^yadm" | head -1)
+        echo "[OK] yadm installed (${yadm_version:-yadm})"
+    else
+        echo "[FAIL] yadm not installed -- install with: brew install yadm"
+        failures=$((failures + 1))
+    fi
+
+    # 2. yadm repo initialized
+    if yadm status &> /dev/null; then
+        echo "[OK] yadm repo initialized"
+    else
+        echo "[FAIL] yadm repo not initialized -- run: yadm init"
+        failures=$((failures + 1))
+    fi
+
+    # 3. Remote configured
+    local remote_url
+    remote_url=$(yadm remote get-url origin 2>/dev/null) || true
+    if [[ -n "$remote_url" ]]; then
+        echo "[OK] Remote: $remote_url"
+    else
+        echo "[FAIL] No remote configured -- run: yadm remote add origin <url>"
+        failures=$((failures + 1))
+    fi
+
+    # 4. Network reachable
+    if [[ -z "$ELLIPSIS_REMOTE_HOST" ]]; then
+        # Try to auto-detect if config hasn't been written yet
+        detect_remote 2>/dev/null || true
+    fi
+    if [[ -n "$ELLIPSIS_REMOTE_HOST" ]]; then
+        if check_network 2>/dev/null; then
+            echo "[OK] Network: ${ELLIPSIS_REMOTE_HOST} reachable via ${ELLIPSIS_REMOTE_TRANSPORT}"
+        else
+            echo "[FAIL] Network: ${ELLIPSIS_REMOTE_HOST} not reachable"
+            failures=$((failures + 1))
+        fi
+    else
+        echo "[WARN] Network: could not determine remote host (run ellipsis init)"
+    fi
+
+    # 5. Config file exists
+    if [[ -f "$ELLIPSIS_CONFIG_FILE" ]]; then
+        echo "[OK] Config: $ELLIPSIS_CONFIG_FILE"
+    else
+        echo "[FAIL] Config not found -- run: ellipsis init"
+        failures=$((failures + 1))
+    fi
+
+    # 6. Pre-commit hook installed
+    local hook_file
+    hook_file="$(yadm_hook_dir)/pre-commit"
+    if [[ -f "$hook_file" ]] && grep -q "Managed by ellipsis" "$hook_file"; then
+        echo "[OK] Pre-commit hook installed"
+    else
+        echo "[FAIL] Pre-commit hook not installed -- run: ellipsis init"
+        failures=$((failures + 1))
+    fi
+
+    # 7. Scheduler active
+    local os
+    os=$(detect_os)
+    case "$os" in
+        macos)
+            if launchctl list 2>/dev/null | grep -q "$ELLIPSIS_LAUNCHD_LABEL"; then
+                echo "[OK] Scheduler: LaunchAgent loaded ($ELLIPSIS_LAUNCHD_LABEL)"
+            else
+                echo "[FAIL] Scheduler: LaunchAgent not loaded -- run: ellipsis init"
+                failures=$((failures + 1))
+            fi
+            ;;
+        linux)
+            if command -v systemctl &> /dev/null && systemctl --user is-active ellipsis-sync.timer &> /dev/null; then
+                echo "[OK] Scheduler: systemd timer active"
+            elif crontab -l 2>/dev/null | grep -q "# ellipsis-sync"; then
+                echo "[OK] Scheduler: cron job installed"
+            else
+                echo "[FAIL] Scheduler: no timer/cron found -- run: ellipsis init"
+                failures=$((failures + 1))
+            fi
+            ;;
+        *)
+            echo "[WARN] Scheduler: unknown OS, cannot check"
+            ;;
+    esac
+
+    # 8. ellipsis in PATH
+    if command -v ellipsis &> /dev/null; then
+        echo "[OK] ellipsis in PATH: $(command -v ellipsis)"
+    else
+        echo "[WARN] ellipsis not in PATH (running from $(ellipsis_bin_path))"
+    fi
+
+    # 9. Stale lock file
+    if [[ -d "$ELLIPSIS_LOCK" ]]; then
+        echo "[WARN] Lock file exists at $ELLIPSIS_LOCK -- a sync may be stuck"
+        echo "       To clear: rmdir $ELLIPSIS_LOCK"
+    else
+        echo "[OK] No stale lock file"
+    fi
+
+    # 10. Log file writable
+    mkdir -p "$(dirname "$ELLIPSIS_LOGFILE")" 2>/dev/null || true
+    if touch "$ELLIPSIS_LOGFILE" 2>/dev/null; then
+        echo "[OK] Log file writable: $ELLIPSIS_LOGFILE"
+    else
+        echo "[FAIL] Cannot write to log file: $ELLIPSIS_LOGFILE"
+        failures=$((failures + 1))
+    fi
+
+    # 11. Auto-add directories exist
+    if [[ -n "$ELLIPSIS_AUTO_ADD_DIRS" ]]; then
+        for dir in $ELLIPSIS_AUTO_ADD_DIRS; do
+            dir="${dir/#\~/$HOME}"
+            if [[ -d "$dir" ]]; then
+                echo "[OK] Auto-add directory exists: $dir"
+            else
+                echo "[WARN] Auto-add directory missing: $dir"
+            fi
+        done
+    fi
+
+    echo ""
+    if [[ "$failures" -gt 0 ]]; then
+        echo "$failures check(s) failed."
+        exit 1
+    else
+        echo "All checks passed."
+    fi
+}
+
+# --- Subcommand: uninstall ---
+cmd_uninstall() {
+    echo "This will remove all ellipsis configuration:"
+    echo "  - Scheduler (LaunchAgent/systemd timer/cron)"
+    echo "  - Pre-commit hook (if managed by ellipsis)"
+    echo "  - Config directory ($ELLIPSIS_CONFIG_DIR)"
+    echo "  - Log file ($ELLIPSIS_LOGFILE)"
+    echo ""
+    echo "Your yadm repo and dotfiles will NOT be affected."
+    echo ""
+    read -rp "Type 'yes' to confirm: " confirm
+
+    if [[ "$confirm" != "yes" ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    # Remove scheduler
+    local os
+    os=$(detect_os)
+    case "$os" in
+        macos)
+            local plist_path
+            plist_path=$(launchagent_path)
+            if [[ -f "$plist_path" ]]; then
+                launchctl unload "$plist_path" 2>/dev/null || true
+                rm -f "$plist_path"
+                echo "Removed LaunchAgent"
+            fi
+            ;;
+        linux)
+            if command -v systemctl &> /dev/null; then
+                systemctl --user disable --now ellipsis-sync.timer 2>/dev/null || true
+                rm -f "$HOME/.config/systemd/user/ellipsis-sync.service"
+                rm -f "$HOME/.config/systemd/user/ellipsis-sync.timer"
+                systemctl --user daemon-reload 2>/dev/null || true
+                echo "Removed systemd timer"
+            fi
+            if crontab -l 2>/dev/null | grep -q "# ellipsis-sync"; then
+                crontab -l 2>/dev/null | grep -v "# ellipsis-sync" | crontab -
+                echo "Removed cron job"
+            fi
+            ;;
+    esac
+
+    # Remove pre-commit hook (only if managed by ellipsis)
+    local hook_file
+    hook_file="$(yadm_hook_dir)/pre-commit"
+    if [[ -f "$hook_file" ]] && grep -q "Managed by ellipsis" "$hook_file"; then
+        rm -f "$hook_file"
+        echo "Removed pre-commit hook"
+    fi
+
+    # Remove config
+    if [[ -d "$ELLIPSIS_CONFIG_DIR" ]]; then
+        rm -rf "$ELLIPSIS_CONFIG_DIR"
+        echo "Removed config directory"
+    fi
+
+    # Remove log and data
+    if [[ -d "$ELLIPSIS_DATA_DIR" ]]; then
+        rm -rf "$ELLIPSIS_DATA_DIR"
+        echo "Removed data directory"
+    fi
+
+    # Remove lock if present
+    rmdir "$ELLIPSIS_LOCK" 2>/dev/null && echo "Removed stale lock file" || true
+
+    echo ""
+    local bin_path
+    bin_path=$(ellipsis_bin_path)
+    echo "Uninstall complete."
+    echo "To finish, remove the ellipsis binary: rm $bin_path"
+}
+
+# --- Subcommand: version ---
+cmd_version() {
+    echo "ellipsis $ELLIPSIS_VERSION"
+}
+
+# --- Subcommand: help ---
+cmd_help() {
+    cat << 'EOF'
+ellipsis -- automated dotfile management and syncing
+
+Usage: ellipsis <command> [options]
+
+Commands:
+  init          Set up automated syncing (config, scheduler, pre-commit hook)
+  sync          Run a sync cycle (stage, commit, push)
+  log           View the sync log
+  doctor        Verify setup health
+  uninstall     Remove ellipsis configuration (keeps yadm and dotfiles)
+  version       Print version
+  help          Show this help
+
+Log options:
+  ellipsis log              Show last 20 log entries
+  ellipsis log -f           Follow the log
+  ellipsis log -n 50        Show last 50 entries
+  ellipsis log --clear      Clear the log
+
+Configuration:
+  Config file: ${XDG_CONFIG_HOME:-~/.config}/ellipsis/config.sh
+
+  ELLIPSIS_AUTO_ADD_DIRS      Directories to auto-add new files from
+  ELLIPSIS_SYNC_INTERVAL      Seconds between syncs (default: 900)
+  ELLIPSIS_COMMIT_PREFIX      Commit message prefix (default: "auto")
+  ELLIPSIS_REMOTE_HOST        Git remote hostname (auto-detected)
+  ELLIPSIS_REMOTE_TRANSPORT   "ssh" or "https" (auto-detected)
+  ELLIPSIS_SHELL_CONFIGS      Shell config files to validate (auto-detected)
+  ELLIPSIS_EXTRA_SECRET_PATTERNS  Additional regex for secrets scanning
+  ELLIPSIS_LAUNCHD_LABEL      macOS LaunchAgent label
+  ELLIPSIS_LOGFILE            Log file path
+  ELLIPSIS_LOCK               Lock file path
+
+Prerequisites:
+  - yadm (https://yadm.io) must be installed and initialized
+  - A remote must be configured: yadm remote add origin <url>
+
+More info: https://github.com/kapowaz/ellipsis
+EOF
+}
+
+# --- Dispatch ---
+main() {
+    case "${1:-help}" in
+        init)      shift; cmd_init "$@" ;;
+        sync)      shift; cmd_sync "$@" ;;
+        log)       shift; cmd_log "$@" ;;
+        doctor)    shift; cmd_doctor "$@" ;;
+        uninstall) shift; cmd_uninstall "$@" ;;
+        version|-v|--version) cmd_version ;;
+        help|-h|--help) cmd_help ;;
+        *) echo "Unknown command: $1"; echo ""; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"
