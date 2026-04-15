@@ -188,7 +188,7 @@ cmd_init() {
     echo ""
 
     read -rp "Accept these defaults? [Y/n] " accept
-    if [[ "${accept,,}" == "n" ]]; then
+    if [[ "$(echo "$accept" | tr '[:upper:]' '[:lower:]')" == "n" ]]; then
         read -rp "Remote host [${ELLIPSIS_REMOTE_HOST}]: " input
         [[ -n "$input" ]] && ELLIPSIS_REMOTE_HOST="$input"
 
@@ -491,7 +491,7 @@ migrate_existing() {
         echo ""
         read -rp "Unload the old LaunchAgent? (ellipsis will handle syncing now) [Y/n] " migrate
 
-        if [[ "${migrate,,}" != "n" ]]; then
+        if [[ "$(echo "$migrate" | tr '[:upper:]' '[:lower:]')" != "n" ]]; then
             if [[ -n "$old_plist" ]]; then
                 launchctl unload "$old_plist" 2>/dev/null || true
                 echo "Unloaded old LaunchAgent."
@@ -588,7 +588,7 @@ cmd_log() {
 
     if $clear; then
         read -rp "Clear the sync log? [y/N] " confirm
-        if [[ "${confirm,,}" == "y" ]]; then
+        if [[ "$(echo "$confirm" | tr '[:upper:]' '[:lower:]')" == "y" ]]; then
             : > "$ELLIPSIS_LOGFILE"
             echo "Log cleared."
         fi
