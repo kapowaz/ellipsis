@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-ELLIPSIS_VERSION="1.0.0"
+ELLIPSIS_VERSION="1.0.1"
 
 # --- Defaults (overridden by config) ---
 ELLIPSIS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ellipsis"
@@ -285,7 +285,7 @@ SHELL_CONFIGS="$shell_configs_for_hook"
 
 for config in \$SHELL_CONFIGS; do
     if yadm diff --cached --name-only | grep -q "^\${config}\$"; then
-        CONTENT=\$(yadm show :".\${config}")
+        CONTENT=\$(yadm show ":\${config}")
 
         # Syntax check
         case "\$config" in
@@ -560,7 +560,7 @@ cmd_sync() {
             log "WARN: commit created but push failed (will retry next cycle)"
         fi
     else
-        log "WARN: commit failed (pre-commit hook may have blocked it)"
+        log "WARN: commit failed -- git output above in $ELLIPSIS_LOGFILE"
     fi
 }
 
@@ -721,7 +721,32 @@ cmd_doctor() {
         failures=$((failures + 1))
     fi
 
-    # 11. Auto-add directories exist
+    # 11. Sync health
+    if [[ -f "$ELLIPSIS_LOGFILE" ]]; then
+        local log_lines last_ok_line last_ok_stamp failed_since last_error
+        log_lines=$(wc -l < "$ELLIPSIS_LOGFILE" | tr -d ' ')
+        last_ok_line=$(grep -n "OK: pushed" "$ELLIPSIS_LOGFILE" | tail -1 | cut -d: -f1)
+        if [[ -n "$last_ok_line" ]]; then
+            last_ok_stamp=$(sed -n "${last_ok_line}p" "$ELLIPSIS_LOGFILE" | cut -d' ' -f1-2)
+            failed_since=$(tail -n "$((log_lines - last_ok_line))" "$ELLIPSIS_LOGFILE" | grep -c "WARN:" || true)
+        else
+            last_ok_stamp="never"
+            failed_since=$(grep -c "WARN:" "$ELLIPSIS_LOGFILE" || true)
+        fi
+        if [[ "$failed_since" -gt 0 ]]; then
+            last_error=$(grep -E "^(fatal|error):" "$ELLIPSIS_LOGFILE" | tail -1)
+            echo "[FAIL] Sync: $failed_since failed attempt(s) since the last push ($last_ok_stamp)"
+            [[ -n "$last_error" ]] && echo "       Last error: $last_error"
+            echo "       Full log: $ELLIPSIS_LOGFILE"
+            failures=$((failures + 1))
+        else
+            echo "[OK] Sync: last push $last_ok_stamp"
+        fi
+    else
+        echo "[WARN] Sync: no log yet -- run: ellipsis sync"
+    fi
+
+    # 12. Auto-add directories exist
     if [[ -n "$ELLIPSIS_AUTO_ADD_DIRS" ]]; then
         for dir in $ELLIPSIS_AUTO_ADD_DIRS; do
             dir="${dir/#\~/$HOME}"
