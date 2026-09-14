@@ -173,6 +173,7 @@ Example `doctor` output:
 [OK] ellipsis in PATH: /Users/you/bin/ellipsis
 [OK] No stale lock file
 [OK] Log file writable
+[OK] Sync: last push 2026-06-10 11:41:44
 
 All checks passed.
 ```
