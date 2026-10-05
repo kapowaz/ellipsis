@@ -170,7 +170,8 @@ Example `doctor` output:
 [OK] Config: ~/.config/ellipsis/config.sh
 [OK] Pre-commit hook installed
 [OK] Scheduler: LaunchAgent loaded (io.github.ellipsis.sync)
-[OK] ellipsis in PATH: /Users/you/bin/ellipsis
+[OK] Scheduler binary: /opt/homebrew/bin/ellipsis
+[OK] ellipsis in PATH: /opt/homebrew/bin/ellipsis
 [OK] No stale lock file
 [OK] Log file writable
 [OK] Sync: last push 2026-06-10 11:41:44
