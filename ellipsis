@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-ELLIPSIS_VERSION="1.0.2"
+ELLIPSIS_VERSION="1.0.3"
 
 # --- Defaults (overridden by config) ---
 ELLIPSIS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ellipsis"
@@ -167,6 +167,13 @@ scheduler_bin_path() {
             fi
             ;;
     esac
+}
+
+unpushed_count() {
+    # Local commits that the upstream branch does not have; 0 without an upstream
+    local count
+    count=$(yadm rev-list --count '@{u}..HEAD' 2>/dev/null) || count=0
+    echo "${count:-0}"
 }
 
 yadm_hook_dir() {
@@ -567,9 +574,20 @@ cmd_sync() {
     # Stage modifications to tracked files
     yadm add -u
 
-    # Check for changes
+    # Check for changes. With none, still push commits that an earlier cycle
+    # created but could not push, so a failed push is retried.
     if yadm diff --cached --quiet; then
-        log "OK: no changes"
+        local pending
+        pending=$(unpushed_count)
+        if [[ "$pending" -gt 0 ]]; then
+            if yadm push 2>> "$ELLIPSIS_LOGFILE"; then
+                log "OK: pushed ${pending} earlier commit(s)"
+            else
+                log "WARN: push of ${pending} earlier commit(s) failed (will retry next cycle)"
+            fi
+        else
+            log "OK: no changes"
+        fi
         exit 0
     fi
 

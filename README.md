@@ -97,7 +97,7 @@ Each sync cycle (whether triggered by the scheduler or manually):
 5. Commits with a descriptive message (e.g. `auto: update .zshrc`)
 6. Pushes to the remote
 
-If the network is unreachable, the cycle is skipped. If push fails, the commit is preserved locally and retried on the next cycle.
+If the network is unreachable, the cycle is skipped. If push fails, the commit is preserved locally and retried on the next cycle, also when no file has changed since.
 
 ### Pre-commit validation
 
