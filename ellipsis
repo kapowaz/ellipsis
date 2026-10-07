@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-ELLIPSIS_VERSION="1.0.1"
+ELLIPSIS_VERSION="1.0.2"
 
 # --- Defaults (overridden by config) ---
 ELLIPSIS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ellipsis"
@@ -126,15 +126,47 @@ require_yadm() {
 }
 
 ellipsis_bin_path() {
-    # Resolve the path to this script
+    # Absolute path to this script, without resolving symlinks. Homebrew puts
+    # a stable symlink on PATH that points into a versioned Cellar directory;
+    # the resolved path is deleted by the next upgrade, which silently breaks
+    # the scheduler.
     local path="$0"
-    if command -v realpath &> /dev/null; then
-        realpath "$path"
-    elif command -v readlink &> /dev/null; then
-        readlink -f "$path" 2>/dev/null || echo "$path"
-    else
-        echo "$path"
+    if [[ "$path" != */* ]]; then
+        path=$(command -v "$path" 2>/dev/null || echo "$path")
     fi
+    if [[ "$path" != /* ]]; then
+        path="$(cd "$(dirname "$path")" && pwd)/$(basename "$path")"
+    fi
+    # Invoked through the Cellar path directly: prefer the prefix symlink
+    if [[ "$path" == */Cellar/ellipsis/*/bin/ellipsis ]]; then
+        local stable="${path%%/Cellar/*}/bin/ellipsis"
+        if [[ -x "$stable" ]]; then
+            path="$stable"
+        fi
+    fi
+    echo "$path"
+}
+
+scheduler_bin_path() {
+    # The ellipsis binary the installed scheduler runs, or nothing
+    local os="$1"
+    case "$os" in
+        macos)
+            local plist_path
+            plist_path=$(launchagent_path)
+            if [[ -f "$plist_path" ]]; then
+                /usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$plist_path" 2>/dev/null
+            fi
+            ;;
+        linux)
+            local unit_file="$HOME/.config/systemd/user/ellipsis-sync.service"
+            if [[ -f "$unit_file" ]]; then
+                sed -n 's/^ExecStart=\(.*\) sync$/\1/p' "$unit_file"
+            else
+                crontab -l 2>/dev/null | grep "# ellipsis-sync" | awk '{print $6}'
+            fi
+            ;;
+    esac
 }
 
 yadm_hook_dir() {
@@ -696,6 +728,20 @@ cmd_doctor() {
             echo "[WARN] Scheduler: unknown OS, cannot check"
             ;;
     esac
+
+    # 7b. Scheduler points at a binary that exists and survives upgrades
+    local sched_bin
+    sched_bin=$(scheduler_bin_path "$os")
+    if [[ -n "$sched_bin" ]]; then
+        if [[ ! -x "$sched_bin" ]]; then
+            echo "[FAIL] Scheduler binary missing: $sched_bin -- run: ellipsis init"
+            failures=$((failures + 1))
+        elif [[ "$sched_bin" == */Cellar/* ]]; then
+            echo "[WARN] Scheduler binary is in a versioned Homebrew directory and breaks on upgrade: $sched_bin -- run: ellipsis init"
+        else
+            echo "[OK] Scheduler binary: $sched_bin"
+        fi
+    fi
 
     # 8. ellipsis in PATH
     if command -v ellipsis &> /dev/null; then
